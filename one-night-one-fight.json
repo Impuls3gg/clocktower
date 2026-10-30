@@ -1,0 +1,33 @@
+[
+  {
+    "id": "_meta",
+    "name": "ONE NIGHT ONE FIGHT",
+    "author": "Kirill736",
+    "bootlegger": [
+      "The game takes place only on the first night and the first day. After the first day, each player votes in secret. The player who receives the most votes are executed and dies. In case of the tie, all tie players will be executed. If Demon and minions survives, EVIL TEAM wins, otherwise, GOOD TEAM wins."
+    ]
+  },
+  "steward",
+  "investigator",
+  "clockmaker",
+  "librarian",
+  "shugenja",
+  "empath",
+  "chambermaid",
+  "mathematician",
+  "dreamer",
+  "nightwatchman",
+  "seamstress",
+  "philosopher",
+  "slayer",
+  "goon",
+  "recluse",
+  "mutant",
+  "snitch",
+  "cerenovus",
+  "marionette",
+  "baron",
+  "boffin",
+  "pukka",
+  "bootlegger"
+]
