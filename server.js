@@ -90,8 +90,53 @@ function normalizeGame(body, games, selfId) {
     players.push({ seat, nick, role, score });
   });
 
+  // голосования по порядку: кто выставлен, сколько голосов, кого заголосовали
+  const votings = [];
+  const outRound = new Map(); // номер игрока -> в каком голосовании заголосован
+  votingsOf(b).forEach((v, vi) => {
+    const label = `Голосование ${vi + 1}`;
+    const nominations = [];
+    const nominated = new Set();
+    (Array.isArray(v?.nominations) ? v.nominations : []).forEach((n) => {
+      const seat = Number(n.seat);
+      if (!seats.has(seat)) errors.push(`${label}: игрока №${n.seat} нет в таблице`);
+      else if (nominated.has(seat)) errors.push(`${label}: игрок №${seat} выставлен дважды`);
+      else if (outRound.has(seat)) errors.push(`${label}: игрок №${seat} уже заголосован в голосовании ${outRound.get(seat)}`);
+      nominated.add(seat);
+
+      const votes = Number(n.votes ?? 0);
+      if (!Number.isInteger(votes) || votes < 0 || votes > rawPlayers.length)
+        errors.push(`${label}: у игрока №${seat} некорректное число голосов`);
+
+      nominations.push({ seat, votes, out: n.out === true });
+    });
+    for (const n of nominations) if (n.out) outRound.set(n.seat, vi + 1);
+    if (nominations.length) votings.push({ nominations });
+  });
+
   players.sort((a, b2) => a.seat - b2.seat);
-  return { errors, game: { number, host, date, time, winner, players } };
+  return { errors, game: { number, host, date, time, winner, players, votings } };
+}
+
+// Старые игры хранили одно голосование в поле nominations
+function votingsOf(game) {
+  if (Array.isArray(game.votings)) return game.votings;
+  return Array.isArray(game.nominations) && game.nominations.length ? [{ nominations: game.nominations }] : [];
+}
+
+// номер игрока -> { times, votes, outRound } по всем голосованиям игры
+function votingSummary(game) {
+  const map = new Map();
+  votingsOf(game).forEach((v, vi) => {
+    for (const n of v.nominations) {
+      const s = map.get(n.seat) || { times: 0, votes: 0, outRound: null };
+      s.times++;
+      s.votes += n.votes;
+      if (n.out) s.outRound = vi + 1;
+      map.set(n.seat, s);
+    }
+  });
+  return map;
 }
 
 // ---------- экспорт в Excel ----------
@@ -133,11 +178,16 @@ async function buildWorkbook(games) {
     { header: 'Команда', key: 'alignment', width: 10 },
     { header: 'Победил', key: 'won', width: 9 },
     { header: 'Баллы', key: 'score', width: 9 },
+    { header: 'Выставлялся (раз)', key: 'nominated', width: 12 },
+    { header: 'Голосов всего', key: 'votes', width: 10 },
+    { header: 'Заголосован в голосовании №', key: 'out', width: 14 },
   ];
   for (const g of sorted) {
+    const summary = votingSummary(g);
     for (const p of g.players) {
       const role = SCRIPT.byId[p.role];
       const team = role ? SCRIPT.teams[role.team] : null;
+      const vs = summary.get(p.seat);
       flat.addRow({
         number: g.number,
         date: excelDate(g),
@@ -151,10 +201,47 @@ async function buildWorkbook(games) {
         alignment: team ? WIN_LABEL[team.alignment] : '',
         won: team ? (team.alignment === g.winner ? 'Да' : 'Нет') : '',
         score: p.score,
+        nominated: vs ? vs.times : 0,
+        votes: vs ? vs.votes : 0,
+        out: vs ? vs.outRound : null,
       });
     }
   }
   styleSheet(flat);
+
+  // 1б. Голосования: одна строка = один выставленный игрок в одном голосовании
+  const vsheet = wb.addWorksheet('Голосования');
+  vsheet.columns = [
+    { header: 'Игра №', key: 'number', width: 9 },
+    { header: 'Дата', key: 'date', width: 12, style: { numFmt: 'dd-mm-yyyy' } },
+    { header: 'Голосование №', key: 'round', width: 14 },
+    { header: 'Номер игрока', key: 'seat', width: 8 },
+    { header: 'Игрок', key: 'nick', width: 20 },
+    { header: 'Роль', key: 'role', width: 16 },
+    { header: 'Команда', key: 'alignment', width: 10 },
+    { header: 'Голосов', key: 'votes', width: 9 },
+    { header: 'Заголосован', key: 'out', width: 12 },
+  ];
+  for (const g of sorted) {
+    votingsOf(g).forEach((v, vi) => {
+      for (const n of v.nominations) {
+        const p = g.players.find((x) => x.seat === n.seat);
+        const role = SCRIPT.byId[p?.role];
+        vsheet.addRow({
+          number: g.number,
+          date: excelDate(g),
+          round: vi + 1,
+          seat: n.seat,
+          nick: p ? p.nick : '',
+          role: role ? role.name : '',
+          alignment: role ? WIN_LABEL[SCRIPT.teams[role.team].alignment] : '',
+          votes: n.votes,
+          out: n.out ? 'Да' : '',
+        });
+      }
+    });
+  }
+  styleSheet(vsheet);
 
   // 2. Игры
   const gs = wb.addWorksheet('Игры');
@@ -166,9 +253,14 @@ async function buildWorkbook(games) {
     { header: 'Победа', key: 'winner', width: 9 },
     { header: 'Игроков', key: 'count', width: 9 },
     { header: 'Демон', key: 'demon', width: 20 },
+    { header: 'Голосований', key: 'rounds', width: 12 },
+    { header: 'Заголосованы (№ голосования)', key: 'out', width: 30 },
   ];
   for (const g of sorted) {
     const demons = g.players.filter((p) => SCRIPT.byId[p.role]?.team === 'demon').map((p) => p.nick);
+    const outNicks = votingsOf(g).flatMap((v, vi) =>
+      v.nominations.filter((n) => n.out).map((n) => `${g.players.find((p) => p.seat === n.seat)?.nick ?? n.seat} (${vi + 1})`)
+    );
     gs.addRow({
       number: g.number,
       date: excelDate(g),
@@ -177,6 +269,8 @@ async function buildWorkbook(games) {
       winner: WIN_LABEL[g.winner],
       count: g.players.length,
       demon: demons.join(', '),
+      rounds: votingsOf(g).length,
+      out: outNicks.join(', '),
     });
   }
   styleSheet(gs);
@@ -184,13 +278,15 @@ async function buildWorkbook(games) {
   // 3. Статистика игроков
   const stats = new Map();
   for (const g of sorted) {
+    const summary = votingSummary(g);
     for (const p of g.players) {
       const role = SCRIPT.byId[p.role];
       if (!role) continue;
       const side = SCRIPT.teams[role.team].alignment;
-      const s = stats.get(p.nick) || { nick: p.nick, games: 0, wins: 0, score: 0, good: 0, goodWins: 0, evil: 0, evilWins: 0 };
+      const s = stats.get(p.nick) || { nick: p.nick, games: 0, wins: 0, score: 0, good: 0, goodWins: 0, evil: 0, evilWins: 0, out: 0 };
       const won = side === g.winner;
       s.games++;
+      if (summary.get(p.seat)?.outRound) s.out++;
       if (won) s.wins++;
       s.score += p.score || 0;
       s[side]++;
@@ -210,6 +306,7 @@ async function buildWorkbook(games) {
     { header: 'Побед за Добро', key: 'goodWins', width: 14 },
     { header: 'Игр за Зло', key: 'evil', width: 11 },
     { header: 'Побед за Зло', key: 'evilWins', width: 13 },
+    { header: 'Раз заголосован', key: 'out', width: 15 },
   ];
   const rows = [...stats.values()].sort((a, b) => b.score - a.score || b.wins - a.wins);
   for (const s of rows) {
@@ -248,7 +345,8 @@ async function buildWorkbook(games) {
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+// no-cache: после обновления приложения браузер сразу берёт свежие файлы
+app.use(express.static(path.join(__dirname, 'public'), { setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache') }));
 
 app.get('/api/games', (req, res) => {
   res.json(loadGames().sort(byNumberDesc));
@@ -278,6 +376,7 @@ app.put('/api/games/:id', (req, res) => {
   const { errors, game } = normalizeGame(req.body, games, req.params.id);
   if (errors.length) return res.status(400).json({ errors });
   games[idx] = { ...games[idx], ...game, updatedAt: new Date().toISOString() };
+  delete games[idx].nominations; // старый формат с одним голосованием
   saveGames(games);
   res.json(games[idx]);
 });

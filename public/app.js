@@ -51,6 +51,12 @@
   const PENCIL =
     '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>';
 
+  const THUMB =
+    '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M1 21h4V9H1v12zm22-11a2 2 0 0 0-2-2h-6.31l.95-4.57.03-.32a1.5 1.5 0 0 0-.44-1.06L14.17 1 7.59 7.59A1.98 1.98 0 0 0 7 9v10a2 2 0 0 0 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2z"/></svg>';
+
+  const TRASH =
+    '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>';
+
   // ---------- роутер ----------
 
   function route() {
@@ -74,10 +80,17 @@
   }
 
   function gameCard(g) {
+    const votings = g.votings || (g.nominations?.length ? [{ nominations: g.nominations }] : []);
+    const outRound = new Map(); // номер игрока -> [голосование, голосов]
+    votings.forEach((v, vi) => v.nominations.forEach((n) => n.out && outRound.set(n.seat, [vi + 1, n.votes])));
+    const rowAttrs = (p) => {
+      const o = outRound.get(p.seat);
+      return o ? ` class="out" title="Заголосован в голосовании ${o[0]}, голосов: ${o[1]}"` : '';
+    };
     const rows = g.players
       .map(
         (p) => `
-        <tr>
+        <tr${rowAttrs(p)}>
           <td class="c-seat">${p.seat}</td>
           <td class="c-nick">${esc(p.nick)}</td>
           <td class="c-role">${roleCell(p.role)}</td>
@@ -185,12 +198,18 @@
 
           <table class="players">
             <thead>
-              <tr><th class="c-seat">№</th><th>Никнейм</th><th class="c-role">Роль</th><th class="c-score">Баллы</th><th class="c-del"></th></tr>
+              <tr><th class="c-nom" title="Выставить на голосование">${THUMB}</th><th class="c-seat">№</th><th>Никнейм</th><th class="c-role">Роль</th><th class="c-score">Баллы</th><th class="c-del"></th></tr>
             </thead>
             <tbody></tbody>
           </table>
           <button type="button" class="btn btn-ghost add-row">+ Добавить игрока</button>
         </div>
+
+        <section class="voting">
+          <h2>Голосования</h2>
+          <div class="rounds"></div>
+          <button type="button" class="btn btn-ghost add-round">+ Новое голосование</button>
+        </section>
 
         <fieldset class="winner">
           <legend>Кто победил?</legend>
@@ -214,9 +233,13 @@
     const tbody = form.querySelector('tbody');
     const head = form.querySelector('.editor-head');
 
+    let uidSeq = 0;
+
     function playerRow(p) {
       const tr = document.createElement('tr');
+      tr.dataset.uid = ++uidSeq;
       tr.innerHTML = `
+        <td class="c-nom"><button type="button" class="nom-btn" title="Выставить на голосование">${esc(p.seat)}</button></td>
         <td class="c-seat"><input class="seat" type="number" min="1" step="1" value="${esc(p.seat)}" aria-label="Номер игрока"></td>
         <td><input class="nick" type="text" list="nicks-list" autocomplete="off" value="${esc(p.nick)}" placeholder="nickname" aria-label="Никнейм"></td>
         <td class="c-role"><button type="button" class="role-btn" aria-label="Выбрать роль"></button></td>
@@ -239,12 +262,154 @@
 
     game.players.forEach((p) => tbody.appendChild(playerRow(p)));
 
+    // ---------- голосования ----------
+    // Выставленные ссылаются на строку игрока по uid, чтобы смена номера игрока не ломала связь.
+    // Номер в колонке 👍 выставляет игрока в активное голосование.
+    const rowByUid = (uid) => tbody.querySelector(`tr[data-uid="${uid}"]`);
+    const rowBySeat = (seat) => [...tbody.querySelectorAll('tr')].find((tr) => Number(tr.querySelector('.seat').value) === seat);
+    const sourceVotings = game.votings || (game.nominations?.length ? [{ nominations: game.nominations }] : []);
+    let rounds = sourceVotings.map((v) => ({
+      noms: v.nominations
+        .map((n) => ({ uid: rowBySeat(n.seat)?.dataset.uid, votes: n.votes || 0, out: !!n.out }))
+        .filter((n) => n.uid),
+    }));
+    if (!rounds.length) rounds.push({ noms: [] });
+    let active = rounds.length - 1;
+
+    const roundsEl = form.querySelector('.rounds');
+
+    // uid -> номер голосования (с 0), в котором игрока заголосовали
+    function outRounds() {
+      const map = new Map();
+      rounds.forEach((r, ri) => r.noms.forEach((n) => n.out && !map.has(n.uid) && map.set(n.uid, ri)));
+      return map;
+    }
+
+    function roundTable(r, ri, maxVotes, outIn) {
+      if (!r.noms.length) {
+        return `<p class="muted vote-hint">Нажмите на номер игрока в колонке ${THUMB}, чтобы выставить его в это голосование.</p>`;
+      }
+      const total = r.noms.reduce((s, n) => s + n.votes, 0);
+      const counts = Array.from({ length: maxVotes + 1 }, (_, i) => i);
+      const rows = r.noms
+        .map((n) => {
+          const tr = rowByUid(n.uid);
+          const seat = tr.querySelector('.seat').value;
+          const nick = tr.querySelector('.nick').value.trim();
+          const btns = counts
+            .map((c) => `<td><button type="button" class="vote-btn${c === n.votes ? ' active' : ''}" data-votes="${c}">${c}</button></td>`)
+            .join('');
+          const outElsewhere = outIn.has(n.uid) && outIn.get(n.uid) !== ri;
+          return `
+            <tr data-uid="${n.uid}" class="${n.out ? 'out' : ''}">
+              <td class="v-del"><button type="button" class="icon-btn del-nom" title="Убрать с голосования" aria-label="Убрать с голосования">${TRASH}</button></td>
+              <td class="v-player"><b>${esc(seat)}</b> <span>${esc(nick)}</span></td>
+              <td class="v-count">${n.votes}</td>
+              ${btns}
+              <td class="v-out"><button type="button" class="out-btn${n.out ? ' active' : ''}" aria-pressed="${n.out}"
+                ${outElsewhere ? `disabled title="Уже заголосован в голосовании ${outIn.get(n.uid) + 1}"` : ''}>Заголосован</button></td>
+            </tr>`;
+        })
+        .join('');
+      return `
+        <div class="votes-wrap">
+          <table class="votes">
+            <thead>
+              <tr>
+                <th></th>
+                <th class="v-player" title="Выставлен">${THUMB}</th>
+                <th class="v-count" title="Всего голосов">${total}</th>
+                <th colspan="${counts.length}">Кол-во голосов</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>`;
+    }
+
+    function renderVotes() {
+      const maxVotes = tbody.querySelectorAll('tr').length;
+      for (const r of rounds) {
+        r.noms = r.noms.filter((n) => rowByUid(n.uid));
+        r.noms.forEach((n) => (n.votes = Math.min(n.votes, maxVotes)));
+      }
+      const outIn = outRounds();
+      const inActive = new Set(rounds[active].noms.map((n) => n.uid));
+
+      tbody.querySelectorAll('tr').forEach((tr) => {
+        const uid = tr.dataset.uid;
+        const btn = tr.querySelector('.nom-btn');
+        const isOut = outIn.has(uid);
+        tr.classList.toggle('nominated', inActive.has(uid));
+        tr.classList.toggle('out', isOut);
+        btn.textContent = tr.querySelector('.seat').value;
+        btn.disabled = isOut && !inActive.has(uid);
+        btn.title = isOut
+          ? `Заголосован в голосовании ${outIn.get(uid) + 1}`
+          : `Выставить в голосование ${active + 1}`;
+      });
+
+      roundsEl.innerHTML = rounds
+        .map(
+          (r, ri) => `
+          <div class="round${ri === active ? ' active' : ''}" data-round="${ri}">
+            <div class="round-head">
+              <button type="button" class="round-title" title="Сделать активным">Голосование ${ri + 1}</button>
+              ${ri === active ? '<span class="round-badge">выставляем сюда</span>' : ''}
+              <button type="button" class="icon-btn del-round" title="Удалить голосование" aria-label="Удалить голосование">${TRASH}</button>
+            </div>
+            ${roundTable(r, ri, maxVotes, outIn)}
+          </div>`
+        )
+        .join('');
+    }
+
+    roundsEl.addEventListener('click', (e) => {
+      const roundEl = e.target.closest('.round');
+      if (!roundEl) return;
+      const ri = Number(roundEl.dataset.round);
+      const r = rounds[ri];
+
+      if (e.target.closest('.del-round')) {
+        if (r.noms.length && !confirm(`Удалить голосование ${ri + 1}?`)) return;
+        rounds.splice(ri, 1);
+        if (!rounds.length) rounds.push({ noms: [] });
+        if (active >= ri) active = Math.max(0, active - 1);
+        if (active >= rounds.length) active = rounds.length - 1;
+        renderVotes();
+        return;
+      }
+
+      const tr = e.target.closest('tbody tr');
+      const n = tr && r.noms.find((x) => x.uid === tr.dataset.uid);
+      if (n && e.target.closest('.del-nom')) r.noms = r.noms.filter((x) => x !== n);
+      else if (n && e.target.closest('.vote-btn')) n.votes = Number(e.target.closest('.vote-btn').dataset.votes);
+      else if (n && e.target.closest('.out-btn')) n.out = !n.out;
+      else if (ri === active) return;
+      active = ri; // любое действие внутри голосования делает его активным
+      renderVotes();
+    });
+
+    form.querySelector('.add-round').addEventListener('click', () => {
+      rounds.push({ noms: [] });
+      active = rounds.length - 1;
+      renderVotes();
+    });
+
+    tbody.addEventListener('input', (e) => {
+      if (e.target.matches('.seat, .nick')) renderVotes();
+    });
+
+    renderVotes();
+
     const usedRoles = () => [...tbody.querySelectorAll('tr')].map((tr) => tr.dataset.role).filter(Boolean);
 
     form.querySelector('.add-row').addEventListener('click', () => {
       const seats = [...tbody.querySelectorAll('.seat')].map((i) => Number(i.value) || 0);
       const tr = playerRow({ seat: Math.max(0, ...seats) + 1, nick: '', role: null, score: null });
       tbody.appendChild(tr);
+      renderVotes();
       tr.querySelector('.nick').focus();
     });
 
@@ -252,6 +417,13 @@
       const tr = e.target.closest('tr');
       if (e.target.closest('.del-row')) {
         tr.remove();
+        renderVotes();
+        return;
+      }
+      if (e.target.closest('.nom-btn')) {
+        const r = rounds[active];
+        if (!r.noms.some((n) => n.uid === tr.dataset.uid)) r.noms.push({ uid: tr.dataset.uid, votes: 0, out: false });
+        renderVotes();
         return;
       }
       if (e.target.closest('.role-btn')) {
@@ -302,6 +474,15 @@
           role: tr.dataset.role || null,
           score: tr.querySelector('.score').value.trim().replace(',', '.') || null,
         })),
+        votings: rounds
+          .filter((r) => r.noms.length)
+          .map((r) => ({
+            nominations: r.noms.map((n) => ({
+              seat: Number(rowByUid(n.uid).querySelector('.seat').value),
+              votes: n.votes,
+              out: n.out,
+            })),
+          })),
       };
     }
 
