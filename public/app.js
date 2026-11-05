@@ -1,4 +1,4 @@
-/* global SCRIPT */
+/* global CATALOG */
 (function () {
   const app = document.getElementById('app');
   const DEFAULT_PLAYERS = 10;
@@ -39,6 +39,13 @@
     return data;
   }
 
+  function showFormErrors(root, list) {
+    const ul = root.querySelector('.errors');
+    ul.innerHTML = list.map((t) => `<li>${esc(t)}</li>`).join('');
+    ul.hidden = !list.length;
+    if (list.length) ul.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
   let toastTimer;
   function toast(text) {
     const el = document.getElementById('toast');
@@ -61,10 +68,13 @@
 
   function route() {
     const hash = location.hash || '#/games';
-    const [, view, id] = hash.split('/');
+    const [, view, id, scriptId] = hash.split('/');
     document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active', a.dataset.nav === view));
     if (view === 'new') return renderEditor(null);
     if (view === 'edit' && id) return renderEditor(id);
+    if (view === 'scripts' && id === 'new') return renderScriptEditor(null);
+    if (view === 'scripts' && id === 'edit' && scriptId) return renderScriptEditor(scriptId);
+    if (view === 'scripts') return renderScripts();
     return renderList();
   }
 
@@ -73,13 +83,13 @@
   // ---------- карточка игры (как на mafia universe) ----------
 
   function roleCell(roleId) {
-    const role = SCRIPT.byId[roleId];
+    const role = CATALOG.byId[roleId];
     if (!role) return '';
-    const team = SCRIPT.teams[role.team];
-    return `<img src="${SCRIPT.icon(role.id)}" alt="${esc(role.name)}" title="${esc(role.name)} — ${team.single}">`;
+    const team = CATALOG.teams[role.team];
+    return `<img src="${CATALOG.icon(role.id)}" alt="${esc(role.name)}" title="${esc(role.name)} — ${team.single}">`;
   }
 
-  function gameCard(g) {
+  function gameCard(g, scriptName) {
     const votings = g.votings || (g.nominations?.length ? [{ nominations: g.nominations }] : []);
     const outRound = new Map(); // номер игрока -> [голосование, голосов]
     votings.forEach((v, vi) => v.nominations.forEach((n) => n.out && outRound.set(n.seat, [vi + 1, n.votes])));
@@ -106,6 +116,7 @@
           <div class="card-title"><a href="#/edit/${g.id}">Игра ${g.number}</a> <span class="check">✓</span></div>
           <div class="card-host">${esc(g.host)}</div>
           <div class="card-date">${fmtDate(g.date)} ${esc(g.time)}</div>
+          ${scriptName ? `<div class="card-script">${esc(scriptName)}</div>` : ''}
         </div>
         <table class="card-table"><tbody>${rows}</tbody></table>
       </article>`;
@@ -116,12 +127,15 @@
   async function renderList() {
     app.innerHTML = '<p class="muted">Загрузка…</p>';
     let games;
+    let scripts;
     try {
-      games = await api('GET', '/api/games');
+      [games, scripts] = await Promise.all([api('GET', '/api/games'), api('GET', '/api/scripts')]);
     } catch (e) {
       app.innerHTML = `<p class="error">Не удалось загрузить игры: ${esc(e.message)}</p>`;
       return;
     }
+    // название сценария на карточке нужно, только когда сценариев несколько
+    const scriptName = (g) => (scripts.length > 1 ? scripts.find((s) => s.id === g.scriptId)?.name : '');
     if (!games.length) {
       app.innerHTML = `
         <div class="empty">
@@ -139,7 +153,7 @@
           <span><i class="sw evil"></i>Победа Зла — ${games.length - good}</span>
         </div>
       </div>
-      <div class="cards">${games.map(gameCard).join('')}</div>`;
+      <div class="cards">${games.map((g) => gameCard(g, scriptName(g))).join('')}</div>`;
   }
 
   // ---------- фичи 1 и 3: создание и изменение игры ----------
@@ -147,9 +161,10 @@
   async function renderEditor(id) {
     app.innerHTML = '<p class="muted">Загрузка…</p>';
     let games;
+    let scripts;
     let game;
     try {
-      games = await api('GET', '/api/games');
+      [games, scripts] = await Promise.all([api('GET', '/api/games'), api('GET', '/api/scripts')]);
       if (id) {
         game = games.find((g) => g.id === id);
         if (!game) throw new Error('Игра не найдена');
@@ -164,6 +179,7 @@
       const { date, time } = nowParts();
       const last = games[0];
       game = {
+        scriptId: last ? last.scriptId : scripts[0].id,
         number: games.reduce((m, g) => Math.max(m, g.number), 0) + 1,
         host: last ? last.host : '',
         date,
@@ -193,6 +209,11 @@
             </label>
             <label class="f-time">Время
               <input name="time" type="time" required value="${esc(game.time)}">
+            </label>
+            <label class="f-script">Сценарий
+              <select name="scriptId">
+                ${scripts.map((s) => `<option value="${esc(s.id)}"${s.id === game.scriptId ? ' selected' : ''}>${esc(s.name)}</option>`).join('')}
+              </select>
             </label>
           </div>
 
@@ -233,6 +254,8 @@
     const tbody = form.querySelector('tbody');
     const head = form.querySelector('.editor-head');
 
+    const currentScript = () => scripts.find((s) => s.id === form.elements.scriptId.value);
+
     let uidSeq = 0;
 
     function playerRow(p) {
@@ -252,15 +275,21 @@
     function setRole(tr, roleId) {
       tr.dataset.role = roleId || '';
       const btn = tr.querySelector('.role-btn');
-      const role = SCRIPT.byId[roleId];
+      const role = CATALOG.byId[roleId];
       btn.innerHTML = role
-        ? `<img src="${SCRIPT.icon(role.id)}" alt=""><span>${esc(role.name)}</span>`
+        ? `<img src="${CATALOG.icon(role.id)}" alt=""><span>${esc(role.name)}</span>`
         : '<span class="placeholder">выбрать</span>';
-      btn.className = 'role-btn' + (role ? ` team-${role.team}` : '');
-      btn.title = role ? `${role.name} — ${SCRIPT.teams[role.team].single}` : 'Выбрать роль';
+      // роль могла остаться от другого сценария: сохранить можно, но это стоит заметить
+      const offScript = role && !currentScript().roles.includes(role.id);
+      btn.className = 'role-btn' + (role ? ` team-${role.team}` : '') + (offScript ? ' off-script' : '');
+      btn.title = role ? `${role.name} — ${CATALOG.teams[role.team].single}` : 'Выбрать роль';
+      if (offScript) btn.title += ' (нет в выбранном сценарии)';
     }
 
     game.players.forEach((p) => tbody.appendChild(playerRow(p)));
+
+    // чтобы во всплывашке картинки появлялись сразу
+    for (const s of scripts) for (const r of s.roles) new Image().src = CATALOG.icon(r);
 
     // ---------- голосования ----------
     // Выставленные ссылаются на строку игрока по uid, чтобы смена номера игрока не ломала связь.
@@ -427,7 +456,7 @@
         return;
       }
       if (e.target.closest('.role-btn')) {
-        const picked = await pickRole(tr.dataset.role, usedRoles());
+        const picked = await pickRole(tr.dataset.role, usedRoles(), currentScript());
         if (picked !== undefined) {
           setRole(tr, picked);
           tr.querySelector('.score').focus();
@@ -437,6 +466,7 @@
 
     form.addEventListener('change', (e) => {
       if (e.target.name === 'winner') head.className = 'editor-head ' + e.target.value;
+      if (e.target.name === 'scriptId') tbody.querySelectorAll('tr').forEach((tr) => setRole(tr, tr.dataset.role));
     });
 
     const del = form.querySelector('.delete');
@@ -453,16 +483,12 @@
       });
     }
 
-    function showErrors(list) {
-      const ul = form.querySelector('.errors');
-      ul.innerHTML = list.map((t) => `<li>${esc(t)}</li>`).join('');
-      ul.hidden = !list.length;
-      if (list.length) ul.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
+    const showErrors = (list) => showFormErrors(form, list);
 
     function collect() {
       const fd = new FormData(form);
       return {
+        scriptId: fd.get('scriptId'),
         number: Number(fd.get('number')),
         host: String(fd.get('host') || '').trim(),
         date: fd.get('date'),
@@ -503,6 +529,249 @@
     });
   }
 
+  // ---------- сценарии: список, импорт и экспорт ----------
+
+  let scriptDraft = null; // импортированный сценарий, который ждёт проверки в редакторе
+
+  const teamsOf = (roles) =>
+    Object.entries(CATALOG.teams)
+      .map(([teamId, team]) => [teamId, team, roles.filter((id) => CATALOG.byId[id].team === teamId)])
+      .filter(([, , ids]) => ids.length);
+
+  function downloadScript(script) {
+    const blob = new Blob([JSON.stringify(CATALOG.scriptToJson(script), null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${script.name}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  function scriptCard(s) {
+    const counts = teamsOf(s.roles)
+      .map(([, team, ids]) => `${team.name}: ${ids.length}`)
+      .join(' · ');
+    const icons = s.roles
+      .map((id) => `<img src="${CATALOG.icon(id)}" alt="" title="${esc(CATALOG.byId[id].name)}" loading="lazy">`)
+      .join('');
+    return `
+      <article class="script-card" data-id="${esc(s.id)}">
+        <h2><a href="#/scripts/edit/${esc(s.id)}">${esc(s.name)}</a></h2>
+        <p class="muted">${s.author ? `${esc(s.author)} · ` : ''}игр: ${s.games}</p>
+        <p class="muted">${counts}</p>
+        <div class="script-icons">${icons}</div>
+        <div class="script-actions">
+          <a class="btn" href="#/scripts/edit/${esc(s.id)}">Изменить</a>
+          <button type="button" class="btn export-script">Экспорт JSON</button>
+        </div>
+      </article>`;
+  }
+
+  async function renderScripts() {
+    app.innerHTML = '<p class="muted">Загрузка…</p>';
+    let scripts;
+    try {
+      scripts = await api('GET', '/api/scripts');
+    } catch (e) {
+      app.innerHTML = `<p class="error">Не удалось загрузить сценарии: ${esc(e.message)}</p>`;
+      return;
+    }
+    app.innerHTML = `
+      <div class="list-head">
+        <h1>Сценарии <span class="muted">(${scripts.length})</span></h1>
+        <div class="script-actions">
+          <label class="btn">Импорт JSON<input type="file" class="import-script" accept=".json,application/json" hidden></label>
+          <a class="btn btn-primary" href="#/scripts/new">+ Новый сценарий</a>
+        </div>
+      </div>
+      <ul class="errors" hidden></ul>
+      <div class="script-cards">${scripts.map(scriptCard).join('')}</div>`;
+
+    app.querySelector('.script-cards').addEventListener('click', (e) => {
+      if (!e.target.closest('.export-script')) return;
+      const id = e.target.closest('.script-card').dataset.id;
+      downloadScript(scripts.find((s) => s.id === id));
+    });
+
+    app.querySelector('.import-script').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      try {
+        scriptDraft = CATALOG.parseScript(JSON.parse(await file.text()));
+        location.hash = '#/scripts/new';
+      } catch {
+        showFormErrors(app, [`Файл «${file.name}» — не JSON сценария`]);
+      }
+    });
+  }
+
+  // ---------- редактор сценария ----------
+
+  async function renderScriptEditor(id) {
+    app.innerHTML = '<p class="muted">Загрузка…</p>';
+    const draft = scriptDraft;
+    scriptDraft = null;
+    let script = draft || { name: '', author: '', roles: [] };
+    if (id) {
+      try {
+        script = (await api('GET', '/api/scripts')).find((s) => s.id === id);
+        if (!script) throw new Error('Сценарий не найден');
+      } catch (e) {
+        app.innerHTML = `<p class="error">${esc(e.message)}</p>`;
+        return;
+      }
+    }
+
+    const selected = [...script.roles];
+    const unknown = draft?.unknown || [];
+
+    const sections = Object.entries(CATALOG.teams)
+      .map(([teamId, team]) => {
+        const items = CATALOG.roles
+          .filter((r) => r.team === teamId)
+          .map(
+            (r) => `<button type="button" class="role-opt" data-role="${r.id}" data-search="${esc(r.name.toLowerCase())}" aria-pressed="false">
+              <img src="${CATALOG.icon(r.id)}" alt="" loading="lazy"><span>${esc(r.name)}</span></button>`
+          )
+          .join('');
+        return `
+          <section class="team team-${teamId}" data-team="${teamId}">
+            <h3>${team.name} <span class="team-count"></span>${team.storyteller ? ' <span class="team-note">для ведущего, игрокам не выдаются</span>' : ''}</h3>
+            <div class="role-grid">${items}</div>
+          </section>`;
+      })
+      .join('');
+
+    app.innerHTML = `
+      <form class="script-editor" novalidate>
+        <h1>${id ? `Сценарий «${esc(script.name)}»` : 'Новый сценарий'}</h1>
+        <div class="script-meta">
+          <label>Название
+            <input name="name" type="text" required autocomplete="off" value="${esc(script.name)}">
+          </label>
+          <label>Автор
+            <input name="author" type="text" autocomplete="off" value="${esc(script.author)}">
+          </label>
+        </div>
+        ${unknown.length ? `<p class="warning">Этих ролей нет в каталоге, они пропущены: ${unknown.map(esc).join(', ')}</p>` : ''}
+        <div class="script-layout">
+          <div class="script-catalog">
+            <input type="search" class="role-search" placeholder="Поиск роли…" aria-label="Поиск роли">
+            ${sections}
+            <p class="muted no-matches" hidden>Ничего не найдено</p>
+          </div>
+          <aside class="script-picked">
+            <h2>В сценарии: <span class="picked-count"></span></h2>
+            <div class="picked-list"></div>
+            <ul class="errors" hidden></ul>
+            <div class="actions">
+              <button type="submit" class="btn btn-primary">Сохранить</button>
+              <a class="btn" href="#/scripts">Отмена</a>
+              ${id ? '<button type="button" class="btn btn-danger delete">Удалить</button>' : ''}
+            </div>
+          </aside>
+        </div>
+      </form>`;
+
+    const form = app.querySelector('form');
+    const tiles = [...form.querySelectorAll('.script-catalog .role-opt')];
+    const pickedList = form.querySelector('.picked-list');
+
+    function renderPicked() {
+      form.querySelector('.picked-count').textContent = selected.length;
+      for (const tile of tiles) {
+        const on = selected.includes(tile.dataset.role);
+        tile.classList.toggle('current', on);
+        tile.setAttribute('aria-pressed', on);
+      }
+      form.querySelectorAll('.script-catalog .team').forEach((section) => {
+        const teamId = section.dataset.team;
+        const count = selected.filter((r) => CATALOG.byId[r].team === teamId).length;
+        section.querySelector('.team-count').textContent = count ? `(${count})` : '';
+      });
+      pickedList.innerHTML = selected.length
+        ? teamsOf(selected)
+            .map(
+              ([teamId, team, ids]) => `
+              <div class="team team-${teamId}">
+                <h3>${team.name}</h3>
+                ${ids
+                  .map(
+                    (r) => `<button type="button" class="picked-item" data-role="${r}" title="Убрать из сценария">
+                      <img src="${CATALOG.icon(r)}" alt=""><span>${esc(CATALOG.byId[r].name)}</span><i>✕</i></button>`
+                  )
+                  .join('')}
+              </div>`
+            )
+            .join('')
+        : '<p class="muted">Нажимайте на роли слева, чтобы добавить их.</p>';
+    }
+
+    function toggleRole(roleId) {
+      const i = selected.indexOf(roleId);
+      if (i === -1) selected.push(roleId);
+      else selected.splice(i, 1);
+      renderPicked();
+    }
+
+    form.querySelector('.script-catalog').addEventListener('click', (e) => {
+      const tile = e.target.closest('.role-opt');
+      if (tile) toggleRole(tile.dataset.role);
+    });
+
+    pickedList.addEventListener('click', (e) => {
+      const item = e.target.closest('.picked-item');
+      if (item) toggleRole(item.dataset.role);
+    });
+
+    form.querySelector('.role-search').addEventListener('input', (e) => {
+      const q = e.target.value.trim().toLowerCase();
+      for (const tile of tiles) tile.hidden = !tile.dataset.search.includes(q);
+      form.querySelectorAll('.script-catalog .team').forEach((section) => {
+        section.hidden = !section.querySelector('.role-opt:not([hidden])');
+      });
+      form.querySelector('.no-matches').hidden = tiles.some((t) => !t.hidden);
+    });
+
+    // Enter в поиске не должен отправлять форму
+    form.querySelector('.role-search').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') e.preventDefault();
+    });
+
+    const del = form.querySelector('.delete');
+    if (del) {
+      del.addEventListener('click', async () => {
+        if (!confirm(`Удалить сценарий «${script.name}»?`)) return;
+        try {
+          await api('DELETE', `/api/scripts/${id}`);
+          toast(`Сценарий «${script.name}» удалён`);
+          location.hash = '#/scripts';
+        } catch (err) {
+          showFormErrors(form, err.errors);
+        }
+      });
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(form);
+      const data = { name: fd.get('name'), author: fd.get('author'), roles: selected, bootlegger: script.bootlegger };
+      const submit = form.querySelector('[type=submit]');
+      submit.disabled = true;
+      try {
+        const saved = id ? await api('PUT', `/api/scripts/${id}`, data) : await api('POST', '/api/scripts', data);
+        toast(`Сценарий «${saved.name}» сохранён`);
+        location.hash = '#/scripts';
+      } catch (err) {
+        showFormErrors(form, err.errors);
+      } finally {
+        submit.disabled = false;
+      }
+    });
+
+    renderPicked();
+  }
+
   // ---------- всплывающий выбор роли ----------
 
   const picker = document.getElementById('role-picker');
@@ -521,10 +790,11 @@
   }
 
   // Возвращает id роли, null (убрать роль) или undefined (отмена)
-  function pickRole(current, used) {
-    const groups = Object.entries(SCRIPT.teams)
+  function pickRole(current, used, script) {
+    const groups = Object.entries(CATALOG.teams)
       .map(([teamId, team]) => {
-        const roles = SCRIPT.roles.filter((r) => r.team === teamId);
+        if (team.storyteller) return '';
+        const roles = CATALOG.roles.filter((r) => r.team === teamId && script.roles.includes(r.id));
         if (!roles.length) return '';
         const items = roles
           .map((r) => {
@@ -532,7 +802,7 @@
               .filter(Boolean)
               .join(' ');
             return `<button type="button" class="${cls}" data-role="${r.id}" title="${esc(r.name)}">
-              <img src="${SCRIPT.icon(r.id)}" alt=""><span>${esc(r.name)}</span></button>`;
+              <img src="${CATALOG.icon(r.id)}" alt=""><span>${esc(r.name)}</span></button>`;
           })
           .join('');
         return `<section class="team team-${teamId}"><h3>${team.name}</h3><div class="role-grid">${items}</div></section>`;
@@ -541,7 +811,7 @@
     pickerBody.innerHTML = groups;
     picker.hidden = false;
     document.addEventListener('keydown', onPickerKey);
-    (pickerBody.querySelector('.current') || pickerBody.querySelector('.role-opt')).focus();
+    (pickerBody.querySelector('.current') || pickerBody.querySelector('.role-opt'))?.focus();
     return new Promise((resolve) => (pickerResolve = resolve));
   }
 
@@ -551,9 +821,6 @@
   });
   picker.querySelectorAll('[data-close]').forEach((el) => el.addEventListener('click', () => closePicker(undefined)));
   document.getElementById('picker-clear').addEventListener('click', () => closePicker(null));
-
-  // чтобы во всплывашке картинки появлялись сразу
-  for (const r of SCRIPT.roles) new Image().src = SCRIPT.icon(r.id);
 
   route();
 })();

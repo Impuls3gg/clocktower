@@ -3,30 +3,53 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const ExcelJS = require('exceljs');
-const SCRIPT = require('./public/roles.js');
+const CATALOG = require('./public/roles.js');
 
 const PORT = Number(process.env.PORT) || 3777;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'games.json');
-const BACKUP_FILE = path.join(DATA_DIR, 'games.backup.json');
+const SCRIPTS_FILE = path.join(DATA_DIR, 'scripts.json');
+
+// Первый сценарий приложения: к нему относятся игры, сохранённые до появления сценариев
+const DEFAULT_SCRIPT_ID = 'one-night-one-fight';
+const DEFAULT_SCRIPT_FILE = path.join(__dirname, 'one-night-one-fight.json');
 
 // ---------- хранилище ----------
 
-function loadGames() {
+function readJson(file) {
   try {
-    return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch (e) {
-    if (e.code === 'ENOENT') return [];
+    if (e.code === 'ENOENT') return null;
     throw e;
   }
 }
 
-function saveGames(games) {
+function writeJson(file, data) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (fs.existsSync(DB_FILE)) fs.copyFileSync(DB_FILE, BACKUP_FILE);
-  const tmp = DB_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(games, null, 2), 'utf8');
-  fs.renameSync(tmp, DB_FILE);
+  if (fs.existsSync(file)) fs.copyFileSync(file, file.replace(/\.json$/, '.backup.json'));
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
+  fs.renameSync(tmp, file);
+}
+
+function loadGames() {
+  return (readJson(DB_FILE) || []).map((g) => (g.scriptId ? g : { ...g, scriptId: DEFAULT_SCRIPT_ID }));
+}
+
+function saveGames(games) {
+  writeJson(DB_FILE, games);
+}
+
+function loadScripts() {
+  const scripts = readJson(SCRIPTS_FILE);
+  if (scripts) return scripts;
+  const { unknown, ...script } = CATALOG.parseScript(readJson(DEFAULT_SCRIPT_FILE));
+  return [{ id: DEFAULT_SCRIPT_ID, ...script }];
+}
+
+function saveScripts(scripts) {
+  writeJson(SCRIPTS_FILE, scripts);
 }
 
 const byNumberDesc = (a, b) => b.number - a.number;
@@ -42,9 +65,31 @@ function isValidDate(s) {
   return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
 }
 
-function normalizeGame(body, games, selfId) {
+function normalizeScript(body, scripts, selfId) {
   const errors = [];
   const b = body || {};
+
+  const name = String(b.name || '').trim();
+  if (!name) errors.push('Укажите название сценария');
+  else if (scripts.some((s) => s.name.toLowerCase() === name.toLowerCase() && s.id !== selfId))
+    errors.push(`Сценарий «${name}» уже существует`);
+
+  const roles = [...new Set(Array.isArray(b.roles) ? b.roles : [])];
+  if (!roles.some((id) => CATALOG.byId[id] && !CATALOG.teams[CATALOG.byId[id].team].storyteller))
+    errors.push('Добавьте в сценарий хотя бы одну роль для игроков');
+  for (const id of roles) if (!CATALOG.byId[id]) errors.push(`Неизвестная роль «${id}»`);
+
+  const script = { name, author: String(b.author || '').trim(), roles };
+  if (Array.isArray(b.bootlegger)) script.bootlegger = b.bootlegger.map(String);
+  return { errors, script };
+}
+
+function normalizeGame(body, games, selfId, scripts) {
+  const errors = [];
+  const b = body || {};
+
+  const scriptId = b.scriptId || DEFAULT_SCRIPT_ID;
+  if (!scripts.some((s) => s.id === scriptId)) errors.push('Выберите сценарий');
 
   const number = Number(b.number);
   if (!Number.isInteger(number) || number < 1) errors.push('Номер игры должен быть натуральным числом');
@@ -79,7 +124,7 @@ function normalizeGame(body, games, selfId) {
 
     const role = p.role || null;
     if (!role) errors.push(`${row}: выберите роль`);
-    else if (!SCRIPT.byId[role]) errors.push(`${row}: неизвестная роль «${role}»`);
+    else if (!CATALOG.byId[role]) errors.push(`${row}: неизвестная роль «${role}»`);
 
     let score = null;
     if (p.score !== null && p.score !== undefined && String(p.score).trim() !== '') {
@@ -115,7 +160,7 @@ function normalizeGame(body, games, selfId) {
   });
 
   players.sort((a, b2) => a.seat - b2.seat);
-  return { errors, game: { number, host, date, time, winner, players, votings } };
+  return { errors, game: { scriptId, number, host, date, time, winner, players, votings } };
 }
 
 // Старые игры хранили одно голосование в поле nominations
@@ -143,6 +188,14 @@ function votingSummary(game) {
 
 const WIN_LABEL = { good: 'Добро', evil: 'Зло' };
 
+// Сторона, определяемая типом роли; у путешественников её нет, такие ячейки остаются пустыми
+const sideLabel = (team) => (team ? WIN_LABEL[team.alignment] ?? '' : '');
+
+function wonLabel(team, game) {
+  if (!team || !team.alignment) return '';
+  return team.alignment === game.winner ? 'Да' : 'Нет';
+}
+
 function excelDate(game) {
   const [y, m, d] = game.date.split('-').map(Number);
   return new Date(Date.UTC(y, m - 1, d));
@@ -157,11 +210,12 @@ function styleSheet(ws) {
   ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: ws.columnCount } };
 }
 
-async function buildWorkbook(games) {
+async function buildWorkbook(games, scripts) {
   const wb = new ExcelJS.Workbook();
   wb.creator = 'Clocktower Results';
   wb.created = new Date();
   const sorted = [...games].sort((a, b) => a.number - b.number);
+  const scriptName = (g) => scripts.find((s) => s.id === g.scriptId)?.name ?? '';
 
   // 1. Плоская таблица: одна строка = один игрок в одной игре
   const flat = wb.addWorksheet('Результаты');
@@ -169,12 +223,13 @@ async function buildWorkbook(games) {
     { header: 'Игра №', key: 'number', width: 9 },
     { header: 'Дата', key: 'date', width: 12, style: { numFmt: 'dd-mm-yyyy' } },
     { header: 'Время', key: 'time', width: 8 },
+    { header: 'Сценарий', key: 'script', width: 22 },
     { header: 'Ведущий', key: 'host', width: 18 },
     { header: 'Победа', key: 'winner', width: 9 },
     { header: 'Номер игрока', key: 'seat', width: 8 },
     { header: 'Игрок', key: 'nick', width: 20 },
     { header: 'Роль', key: 'role', width: 16 },
-    { header: 'Тип роли', key: 'type', width: 13 },
+    { header: 'Тип роли', key: 'type', width: 15 },
     { header: 'Команда', key: 'alignment', width: 10 },
     { header: 'Победил', key: 'won', width: 9 },
     { header: 'Баллы', key: 'score', width: 9 },
@@ -185,21 +240,22 @@ async function buildWorkbook(games) {
   for (const g of sorted) {
     const summary = votingSummary(g);
     for (const p of g.players) {
-      const role = SCRIPT.byId[p.role];
-      const team = role ? SCRIPT.teams[role.team] : null;
+      const role = CATALOG.byId[p.role];
+      const team = role ? CATALOG.teams[role.team] : null;
       const vs = summary.get(p.seat);
       flat.addRow({
         number: g.number,
         date: excelDate(g),
         time: g.time,
+        script: scriptName(g),
         host: g.host,
         winner: WIN_LABEL[g.winner],
         seat: p.seat,
         nick: p.nick,
         role: role ? role.name : p.role,
         type: team ? team.single : '',
-        alignment: team ? WIN_LABEL[team.alignment] : '',
-        won: team ? (team.alignment === g.winner ? 'Да' : 'Нет') : '',
+        alignment: sideLabel(team),
+        won: wonLabel(team, g),
         score: p.score,
         nominated: vs ? vs.times : 0,
         votes: vs ? vs.votes : 0,
@@ -214,6 +270,7 @@ async function buildWorkbook(games) {
   vsheet.columns = [
     { header: 'Игра №', key: 'number', width: 9 },
     { header: 'Дата', key: 'date', width: 12, style: { numFmt: 'dd-mm-yyyy' } },
+    { header: 'Сценарий', key: 'script', width: 22 },
     { header: 'Голосование №', key: 'round', width: 14 },
     { header: 'Номер игрока', key: 'seat', width: 8 },
     { header: 'Игрок', key: 'nick', width: 20 },
@@ -226,15 +283,16 @@ async function buildWorkbook(games) {
     votingsOf(g).forEach((v, vi) => {
       for (const n of v.nominations) {
         const p = g.players.find((x) => x.seat === n.seat);
-        const role = SCRIPT.byId[p?.role];
+        const role = CATALOG.byId[p?.role];
         vsheet.addRow({
           number: g.number,
           date: excelDate(g),
+          script: scriptName(g),
           round: vi + 1,
           seat: n.seat,
           nick: p ? p.nick : '',
           role: role ? role.name : '',
-          alignment: role ? WIN_LABEL[SCRIPT.teams[role.team].alignment] : '',
+          alignment: sideLabel(role && CATALOG.teams[role.team]),
           votes: n.votes,
           out: n.out ? 'Да' : '',
         });
@@ -249,6 +307,7 @@ async function buildWorkbook(games) {
     { header: 'Игра №', key: 'number', width: 9 },
     { header: 'Дата', key: 'date', width: 12, style: { numFmt: 'dd-mm-yyyy' } },
     { header: 'Время', key: 'time', width: 8 },
+    { header: 'Сценарий', key: 'script', width: 22 },
     { header: 'Ведущий', key: 'host', width: 18 },
     { header: 'Победа', key: 'winner', width: 9 },
     { header: 'Игроков', key: 'count', width: 9 },
@@ -257,7 +316,7 @@ async function buildWorkbook(games) {
     { header: 'Заголосованы (№ голосования)', key: 'out', width: 30 },
   ];
   for (const g of sorted) {
-    const demons = g.players.filter((p) => SCRIPT.byId[p.role]?.team === 'demon').map((p) => p.nick);
+    const demons = g.players.filter((p) => CATALOG.byId[p.role]?.team === 'demon').map((p) => p.nick);
     const outNicks = votingsOf(g).flatMap((v, vi) =>
       v.nominations.filter((n) => n.out).map((n) => `${g.players.find((p) => p.seat === n.seat)?.nick ?? n.seat} (${vi + 1})`)
     );
@@ -265,6 +324,7 @@ async function buildWorkbook(games) {
       number: g.number,
       date: excelDate(g),
       time: g.time,
+      script: scriptName(g),
       host: g.host,
       winner: WIN_LABEL[g.winner],
       count: g.players.length,
@@ -280,16 +340,16 @@ async function buildWorkbook(games) {
   for (const g of sorted) {
     const summary = votingSummary(g);
     for (const p of g.players) {
-      const role = SCRIPT.byId[p.role];
+      const role = CATALOG.byId[p.role];
       if (!role) continue;
-      const side = SCRIPT.teams[role.team].alignment;
+      const side = CATALOG.teams[role.team].alignment;
       const s = stats.get(p.nick) || { nick: p.nick, games: 0, wins: 0, score: 0, good: 0, goodWins: 0, evil: 0, evilWins: 0, out: 0 };
       const won = side === g.winner;
       s.games++;
       if (summary.get(p.seat)?.outRound) s.out++;
       if (won) s.wins++;
       s.score += p.score || 0;
-      s[side]++;
+      if (side) s[side]++;
       if (won) s[side + 'Wins']++;
       stats.set(p.nick, s);
     }
@@ -310,7 +370,9 @@ async function buildWorkbook(games) {
   ];
   const rows = [...stats.values()].sort((a, b) => b.score - a.score || b.wins - a.wins);
   for (const s of rows) {
-    ps.addRow({ ...s, score: Math.round(s.score * 1000) / 1000, winrate: s.wins / s.games, avg: s.score / s.games });
+    // % побед считается только по играм, где сторона известна (без путешественников)
+    const decided = s.good + s.evil;
+    ps.addRow({ ...s, score: Math.round(s.score * 1000) / 1000, winrate: decided ? s.wins / decided : null, avg: s.score / s.games });
   }
   styleSheet(ps);
 
@@ -318,13 +380,13 @@ async function buildWorkbook(games) {
   const rs = wb.addWorksheet('Статистика ролей');
   rs.columns = [
     { header: 'Роль', key: 'role', width: 16 },
-    { header: 'Тип роли', key: 'type', width: 13 },
+    { header: 'Тип роли', key: 'type', width: 15 },
     { header: 'Сыграна раз', key: 'games', width: 12 },
     { header: 'Побед', key: 'wins', width: 8 },
     { header: '% побед', key: 'winrate', width: 9, style: { numFmt: '0%' } },
   ];
-  for (const role of SCRIPT.roles) {
-    const team = SCRIPT.teams[role.team];
+  for (const role of CATALOG.roles) {
+    const team = CATALOG.teams[role.team];
     let n = 0;
     let w = 0;
     for (const g of sorted) {
@@ -334,7 +396,9 @@ async function buildWorkbook(games) {
         if (team.alignment === g.winner) w++;
       }
     }
-    rs.addRow({ role: role.name, type: team.single, games: n, wins: w, winrate: n ? w / n : null });
+    if (!n) continue; // в каталоге почти 200 ролей, несыгранные только мешают
+    const known = !!team.alignment;
+    rs.addRow({ role: role.name, type: team.single, games: n, wins: known ? w : null, winrate: known ? w / n : null });
   }
   styleSheet(rs);
 
@@ -360,7 +424,7 @@ app.get('/api/games/:id', (req, res) => {
 
 app.post('/api/games', (req, res) => {
   const games = loadGames();
-  const { errors, game } = normalizeGame(req.body, games, null);
+  const { errors, game } = normalizeGame(req.body, games, null, loadScripts());
   if (errors.length) return res.status(400).json({ errors });
   const now = new Date().toISOString();
   const saved = { id: crypto.randomUUID(), ...game, createdAt: now, updatedAt: now };
@@ -373,7 +437,7 @@ app.put('/api/games/:id', (req, res) => {
   const games = loadGames();
   const idx = games.findIndex((g) => g.id === req.params.id);
   if (idx === -1) return res.status(404).json({ errors: ['Игра не найдена'] });
-  const { errors, game } = normalizeGame(req.body, games, req.params.id);
+  const { errors, game } = normalizeGame(req.body, games, req.params.id, loadScripts());
   if (errors.length) return res.status(400).json({ errors });
   games[idx] = { ...games[idx], ...game, updatedAt: new Date().toISOString() };
   delete games[idx].nominations; // старый формат с одним голосованием
@@ -389,9 +453,49 @@ app.delete('/api/games/:id', (req, res) => {
   res.status(204).end();
 });
 
+app.get('/api/scripts', (req, res) => {
+  const games = loadGames();
+  const scripts = loadScripts()
+    .map((s) => ({ ...s, games: games.filter((g) => g.scriptId === s.id).length }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  res.json(scripts);
+});
+
+app.post('/api/scripts', (req, res) => {
+  const scripts = loadScripts();
+  const { errors, script } = normalizeScript(req.body, scripts, null);
+  if (errors.length) return res.status(400).json({ errors });
+  const saved = { id: crypto.randomUUID(), ...script };
+  scripts.push(saved);
+  saveScripts(scripts);
+  res.status(201).json(saved);
+});
+
+app.put('/api/scripts/:id', (req, res) => {
+  const scripts = loadScripts();
+  const idx = scripts.findIndex((s) => s.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ errors: ['Сценарий не найден'] });
+  const { errors, script } = normalizeScript(req.body, scripts, req.params.id);
+  if (errors.length) return res.status(400).json({ errors });
+  scripts[idx] = { ...scripts[idx], ...script };
+  saveScripts(scripts);
+  res.json(scripts[idx]);
+});
+
+app.delete('/api/scripts/:id', (req, res) => {
+  const scripts = loadScripts();
+  const rest = scripts.filter((s) => s.id !== req.params.id);
+  if (rest.length === scripts.length) return res.status(404).json({ errors: ['Сценарий не найден'] });
+  if (!rest.length) return res.status(409).json({ errors: ['Нельзя удалить единственный сценарий'] });
+  const used = loadGames().filter((g) => g.scriptId === req.params.id).length;
+  if (used) return res.status(409).json({ errors: [`Сценарий используется в играх: ${used}. Сначала смените им сценарий`] });
+  saveScripts(rest);
+  res.status(204).end();
+});
+
 app.get('/api/export', async (req, res, next) => {
   try {
-    const wb = await buildWorkbook(loadGames());
+    const wb = await buildWorkbook(loadGames(), loadScripts());
     const stamp = new Date().toISOString().slice(0, 10);
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="botc-results-${stamp}.xlsx"`);
