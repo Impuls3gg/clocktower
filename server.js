@@ -132,7 +132,10 @@ function normalizeGame(body, games, selfId, scripts) {
       if (!Number.isFinite(score)) errors.push(`${row}: баллы должны быть числом`);
     }
 
-    players.push({ seat, nick, role, score });
+    const player = { seat, nick, role, score };
+    if (p.flipped === true && CATALOG.canFlip(role)) player.flipped = true; // сменил сторону
+    if (p.dead === true) player.dead = true; // убит
+    players.push(player);
   });
 
   // голосования по порядку: кто выставлен, сколько голосов, кого заголосовали
@@ -149,11 +152,17 @@ function normalizeGame(body, games, selfId, scripts) {
       else if (outRound.has(seat)) errors.push(`${label}: игрок №${seat} уже заголосован в голосовании ${outRound.get(seat)}`);
       nominated.add(seat);
 
-      const votes = Number(n.votes ?? 0);
-      if (!Number.isInteger(votes) || votes < 0 || votes > rawPlayers.length)
-        errors.push(`${label}: у игрока №${seat} некорректное число голосов`);
-
-      nominations.push({ seat, votes, out: n.out === true });
+      // voters — номера проголосовавших; в старых записях было только число голосов
+      if (Array.isArray(n.voters)) {
+        const voters = [...new Set(n.voters.map(Number))];
+        for (const v of voters) if (!seats.has(v)) errors.push(`${label}: проголосовавшего игрока №${v} нет в таблице`);
+        nominations.push({ seat, voters, votes: voters.length, out: n.out === true });
+      } else {
+        const votes = Number(n.votes ?? 0);
+        if (!Number.isInteger(votes) || votes < 0 || votes > rawPlayers.length)
+          errors.push(`${label}: у игрока №${seat} некорректное число голосов`);
+        nominations.push({ seat, votes, out: n.out === true });
+      }
     });
     for (const n of nominations) if (n.out) outRound.set(n.seat, vi + 1);
     if (nominations.length) votings.push({ nominations });
@@ -188,13 +197,21 @@ function votingSummary(game) {
 
 const WIN_LABEL = { good: 'Добро', evil: 'Зло' };
 
-// Сторона, определяемая типом роли; у путешественников её нет, такие ячейки остаются пустыми
-const sideLabel = (team) => (team ? WIN_LABEL[team.alignment] ?? '' : '');
+// Фактическая сторона игрока: по типу роли, с учётом смены стороны.
+// У путешественников её нет, такие ячейки остаются пустыми.
+const sideOf = (p) => (p ? CATALOG.alignmentOf(p.role, p.flipped) : null);
+const sideLabel = (p) => WIN_LABEL[sideOf(p)] ?? '';
 
-function wonLabel(team, game) {
-  if (!team || !team.alignment) return '';
-  return team.alignment === game.winner ? 'Да' : 'Нет';
+function wonLabel(p, game) {
+  const side = sideOf(p);
+  if (!side) return '';
+  return side === game.winner ? 'Да' : 'Нет';
 }
+
+const playerLabel = (g, seat) => {
+  const p = g.players.find((x) => x.seat === seat);
+  return p ? `${seat} ${p.nick}` : String(seat);
+};
 
 function excelDate(game) {
   const [y, m, d] = game.date.split('-').map(Number);
@@ -231,8 +248,10 @@ async function buildWorkbook(games, scripts) {
     { header: 'Роль', key: 'role', width: 16 },
     { header: 'Тип роли', key: 'type', width: 15 },
     { header: 'Команда', key: 'alignment', width: 10 },
+    { header: 'Сменил сторону', key: 'flipped', width: 10 },
     { header: 'Победил', key: 'won', width: 9 },
     { header: 'Баллы', key: 'score', width: 9 },
+    { header: 'Убит', key: 'dead', width: 7 },
     { header: 'Выставлялся (раз)', key: 'nominated', width: 12 },
     { header: 'Голосов всего', key: 'votes', width: 10 },
     { header: 'Заголосован в голосовании №', key: 'out', width: 14 },
@@ -254,9 +273,11 @@ async function buildWorkbook(games, scripts) {
         nick: p.nick,
         role: role ? role.name : p.role,
         type: team ? team.single : '',
-        alignment: sideLabel(team),
-        won: wonLabel(team, g),
+        alignment: sideLabel(p),
+        flipped: p.flipped ? 'Да' : '',
+        won: wonLabel(p, g),
         score: p.score,
+        dead: p.dead ? 'Да' : '',
         nominated: vs ? vs.times : 0,
         votes: vs ? vs.votes : 0,
         out: vs ? vs.outRound : null,
@@ -277,6 +298,7 @@ async function buildWorkbook(games, scripts) {
     { header: 'Роль', key: 'role', width: 16 },
     { header: 'Команда', key: 'alignment', width: 10 },
     { header: 'Голосов', key: 'votes', width: 9 },
+    { header: 'Кто голосовал', key: 'voters', width: 40 },
     { header: 'Заголосован', key: 'out', width: 12 },
   ];
   for (const g of sorted) {
@@ -292,14 +314,59 @@ async function buildWorkbook(games, scripts) {
           seat: n.seat,
           nick: p ? p.nick : '',
           role: role ? role.name : '',
-          alignment: sideLabel(role && CATALOG.teams[role.team]),
+          alignment: sideLabel(p),
           votes: n.votes,
+          voters: (n.voters || []).map((s) => playerLabel(g, s)).join(', '),
           out: n.out ? 'Да' : '',
         });
       }
     });
   }
   styleSheet(vsheet);
+
+  // 1в. Голоса: одна строка = один голос одного игрока за выставленного
+  const ballots = wb.addWorksheet('Голоса');
+  ballots.columns = [
+    { header: 'Игра №', key: 'number', width: 9 },
+    { header: 'Дата', key: 'date', width: 12, style: { numFmt: 'dd-mm-yyyy' } },
+    { header: 'Сценарий', key: 'script', width: 22 },
+    { header: 'Голосование №', key: 'round', width: 14 },
+    { header: 'Голосовал №', key: 'voterSeat', width: 11 },
+    { header: 'Голосовал', key: 'voter', width: 20 },
+    { header: 'Его роль', key: 'voterRole', width: 16 },
+    { header: 'Его команда', key: 'voterSide', width: 11 },
+    { header: 'За кого №', key: 'seat', width: 10 },
+    { header: 'За кого', key: 'nick', width: 20 },
+    { header: 'Роль выставленного', key: 'role', width: 18 },
+    { header: 'Команда выставленного', key: 'side', width: 14 },
+    { header: 'Заголосован', key: 'out', width: 12 },
+  ];
+  for (const g of sorted) {
+    votingsOf(g).forEach((v, vi) => {
+      for (const n of v.nominations) {
+        const target = g.players.find((x) => x.seat === n.seat);
+        for (const seat of n.voters || []) {
+          const voter = g.players.find((x) => x.seat === seat);
+          ballots.addRow({
+            number: g.number,
+            date: excelDate(g),
+            script: scriptName(g),
+            round: vi + 1,
+            voterSeat: seat,
+            voter: voter?.nick ?? '',
+            voterRole: CATALOG.byId[voter?.role]?.name ?? '',
+            voterSide: sideLabel(voter),
+            seat: n.seat,
+            nick: target?.nick ?? '',
+            role: CATALOG.byId[target?.role]?.name ?? '',
+            side: sideLabel(target),
+            out: n.out ? 'Да' : '',
+          });
+        }
+      }
+    });
+  }
+  styleSheet(ballots);
 
   // 2. Игры
   const gs = wb.addWorksheet('Игры');
@@ -342,11 +409,12 @@ async function buildWorkbook(games, scripts) {
     for (const p of g.players) {
       const role = CATALOG.byId[p.role];
       if (!role) continue;
-      const side = CATALOG.teams[role.team].alignment;
-      const s = stats.get(p.nick) || { nick: p.nick, games: 0, wins: 0, score: 0, good: 0, goodWins: 0, evil: 0, evilWins: 0, out: 0 };
+      const side = sideOf(p);
+      const s = stats.get(p.nick) || { nick: p.nick, games: 0, wins: 0, score: 0, good: 0, goodWins: 0, evil: 0, evilWins: 0, out: 0, dead: 0 };
       const won = side === g.winner;
       s.games++;
       if (summary.get(p.seat)?.outRound) s.out++;
+      if (p.dead) s.dead++;
       if (won) s.wins++;
       s.score += p.score || 0;
       if (side) s[side]++;
@@ -367,6 +435,7 @@ async function buildWorkbook(games, scripts) {
     { header: 'Игр за Зло', key: 'evil', width: 11 },
     { header: 'Побед за Зло', key: 'evilWins', width: 13 },
     { header: 'Раз заголосован', key: 'out', width: 15 },
+    { header: 'Раз убит', key: 'dead', width: 9 },
   ];
   const rows = [...stats.values()].sort((a, b) => b.score - a.score || b.wins - a.wins);
   for (const s of rows) {
@@ -382,6 +451,7 @@ async function buildWorkbook(games, scripts) {
     { header: 'Роль', key: 'role', width: 16 },
     { header: 'Тип роли', key: 'type', width: 15 },
     { header: 'Сыграна раз', key: 'games', width: 12 },
+    { header: 'Из них сменив сторону', key: 'flipped', width: 12 },
     { header: 'Побед', key: 'wins', width: 8 },
     { header: '% побед', key: 'winrate', width: 9, style: { numFmt: '0%' } },
   ];
@@ -389,16 +459,18 @@ async function buildWorkbook(games, scripts) {
     const team = CATALOG.teams[role.team];
     let n = 0;
     let w = 0;
+    let flipped = 0;
     for (const g of sorted) {
       for (const p of g.players) {
         if (p.role !== role.id) continue;
         n++;
-        if (team.alignment === g.winner) w++;
+        if (p.flipped) flipped++;
+        if (sideOf(p) === g.winner) w++;
       }
     }
     if (!n) continue; // в каталоге почти 200 ролей, несыгранные только мешают
     const known = !!team.alignment;
-    rs.addRow({ role: role.name, type: team.single, games: n, wins: known ? w : null, winrate: known ? w / n : null });
+    rs.addRow({ role: role.name, type: team.single, games: n, flipped, wins: known ? w : null, winrate: known ? w / n : null });
   }
   styleSheet(rs);
 

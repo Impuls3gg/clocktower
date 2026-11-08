@@ -82,11 +82,19 @@
 
   // ---------- карточка игры (как на mafia universe) ----------
 
-  function roleCell(roleId) {
+  const SIDE_GENITIVE = { good: 'Добра', evil: 'Зла' };
+
+  // «Empath — Горожанин» или «Empath — Горожанин, на стороне Зла»
+  function roleTitle(roleId, flipped) {
     const role = CATALOG.byId[roleId];
+    const title = `${role.name} — ${CATALOG.teams[role.team].single}`;
+    return flipped && CATALOG.canFlip(roleId) ? `${title}, на стороне ${SIDE_GENITIVE[CATALOG.alignmentOf(roleId, true)]}` : title;
+  }
+
+  function roleCell(p) {
+    const role = CATALOG.byId[p.role];
     if (!role) return '';
-    const team = CATALOG.teams[role.team];
-    return `<img src="${CATALOG.icon(role.id)}" alt="${esc(role.name)}" title="${esc(role.name)} — ${team.single}">`;
+    return `<img src="${CATALOG.icon(role.id, p.flipped)}" alt="${esc(role.name)}" title="${esc(roleTitle(role.id, p.flipped))}">`;
   }
 
   function gameCard(g, scriptName) {
@@ -95,7 +103,8 @@
     votings.forEach((v, vi) => v.nominations.forEach((n) => n.out && outRound.set(n.seat, [vi + 1, n.votes])));
     const rowAttrs = (p) => {
       const o = outRound.get(p.seat);
-      return o ? ` class="out" title="Заголосован в голосовании ${o[0]}, голосов: ${o[1]}"` : '';
+      if (o) return ` class="out" title="Заголосован в голосовании ${o[0]}, голосов: ${o[1]}"`;
+      return p.dead ? ' class="dead" title="Убит"' : '';
     };
     const rows = g.players
       .map(
@@ -103,7 +112,7 @@
         <tr${rowAttrs(p)}>
           <td class="c-seat">${p.seat}</td>
           <td class="c-nick">${esc(p.nick)}</td>
-          <td class="c-role">${roleCell(p.role)}</td>
+          <td class="c-role">${roleCell(p)}</td>
           <td class="c-score">${fmtScore(p.score)}</td>
         </tr>`
       )
@@ -219,7 +228,7 @@
 
           <table class="players">
             <thead>
-              <tr><th class="c-nom" title="Выставить на голосование">${THUMB}</th><th class="c-seat">№</th><th>Никнейм</th><th class="c-role">Роль</th><th class="c-score">Баллы</th><th class="c-del"></th></tr>
+              <tr><th class="c-nom" title="Выставить на голосование">${THUMB}</th><th class="c-seat">№</th><th>Никнейм</th><th class="c-role">Роль</th><th class="c-score">Баллы</th><th class="c-dead" title="Убит">☠</th><th class="c-del"></th></tr>
             </thead>
             <tbody></tbody>
           </table>
@@ -267,39 +276,63 @@
         <td><input class="nick" type="text" list="nicks-list" autocomplete="off" value="${esc(p.nick)}" placeholder="nickname" aria-label="Никнейм"></td>
         <td class="c-role"><button type="button" class="role-btn" aria-label="Выбрать роль"></button></td>
         <td class="c-score"><input class="score" type="text" inputmode="decimal" value="${esc(fmtScore(p.score))}" placeholder="0" aria-label="Баллы"></td>
+        <td class="c-dead"><button type="button" class="dead-btn" title="Убит" aria-label="Убит" aria-pressed="false">☠</button></td>
         <td class="c-del"><button type="button" class="icon-btn del-row" title="Удалить строку" aria-label="Удалить строку">✕</button></td>`;
-      setRole(tr, p.role);
+      setRole(tr, p.role, p.flipped);
+      setDead(tr, p.dead);
       return tr;
     }
 
-    function setRole(tr, roleId) {
-      tr.dataset.role = roleId || '';
-      const btn = tr.querySelector('.role-btn');
+    function setRole(tr, roleId, flipped) {
       const role = CATALOG.byId[roleId];
+      flipped = !!flipped && CATALOG.canFlip(roleId);
+      tr.dataset.role = roleId || '';
+      tr.dataset.flipped = flipped ? '1' : '';
+      const btn = tr.querySelector('.role-btn');
       btn.innerHTML = role
-        ? `<img src="${CATALOG.icon(role.id)}" alt=""><span>${esc(role.name)}</span>`
+        ? `<img src="${CATALOG.icon(role.id, flipped)}" alt=""><span>${esc(role.name)}</span>`
         : '<span class="placeholder">выбрать</span>';
       // роль могла остаться от другого сценария: сохранить можно, но это стоит заметить
       const offScript = role && !currentScript().roles.includes(role.id);
-      btn.className = 'role-btn' + (role ? ` team-${role.team}` : '') + (offScript ? ' off-script' : '');
-      btn.title = role ? `${role.name} — ${CATALOG.teams[role.team].single}` : 'Выбрать роль';
+      const side = role && CATALOG.alignmentOf(role.id, flipped);
+      btn.className = 'role-btn' + (role ? ' has-role' : '') + (side ? ` side-${side}` : '') + (offScript ? ' off-script' : '');
+      btn.title = role ? roleTitle(role.id, flipped) : 'Выбрать роль';
       if (offScript) btn.title += ' (нет в выбранном сценарии)';
+    }
+
+    function setDead(tr, dead) {
+      tr.classList.toggle('dead', !!dead);
+      tr.querySelector('.dead-btn').setAttribute('aria-pressed', !!dead);
     }
 
     game.players.forEach((p) => tbody.appendChild(playerRow(p)));
 
     // чтобы во всплывашке картинки появлялись сразу
-    for (const s of scripts) for (const r of s.roles) new Image().src = CATALOG.icon(r);
+    for (const s of scripts) {
+      for (const r of s.roles) {
+        new Image().src = CATALOG.icon(r);
+        if (CATALOG.canFlip(r)) new Image().src = CATALOG.icon(r, true);
+      }
+    }
 
     // ---------- голосования ----------
-    // Выставленные ссылаются на строку игрока по uid, чтобы смена номера игрока не ломала связь.
+    // Выставленные и проголосовавшие ссылаются на строку игрока по uid,
+    // чтобы смена номера игрока не ломала связь.
     // Номер в колонке 👍 выставляет игрока в активное голосование.
+    // voters: null — старая запись, где известно только число голосов (votes).
     const rowByUid = (uid) => tbody.querySelector(`tr[data-uid="${uid}"]`);
     const rowBySeat = (seat) => [...tbody.querySelectorAll('tr')].find((tr) => Number(tr.querySelector('.seat').value) === seat);
+    const seatOf = (uid) => Number(rowByUid(uid).querySelector('.seat').value);
+    const voteCount = (n) => (n.voters ? n.voters.length : n.votes);
     const sourceVotings = game.votings || (game.nominations?.length ? [{ nominations: game.nominations }] : []);
     let rounds = sourceVotings.map((v) => ({
       noms: v.nominations
-        .map((n) => ({ uid: rowBySeat(n.seat)?.dataset.uid, votes: n.votes || 0, out: !!n.out }))
+        .map((n) => ({
+          uid: rowBySeat(n.seat)?.dataset.uid,
+          voters: Array.isArray(n.voters) ? n.voters.map((s) => rowBySeat(s)?.dataset.uid).filter(Boolean) : null,
+          votes: n.votes || 0,
+          out: !!n.out,
+        }))
         .filter((n) => n.uid),
     }));
     if (!rounds.length) rounds.push({ noms: [] });
@@ -314,26 +347,35 @@
       return map;
     }
 
-    function roundTable(r, ri, maxVotes, outIn) {
+    function roundTable(r, ri, outIn) {
       if (!r.noms.length) {
         return `<p class="muted vote-hint">Нажмите на номер игрока в колонке ${THUMB}, чтобы выставить его в это голосование.</p>`;
       }
-      const total = r.noms.reduce((s, n) => s + n.votes, 0);
-      const counts = Array.from({ length: maxVotes + 1 }, (_, i) => i);
+      const total = r.noms.reduce((s, n) => s + voteCount(n), 0);
+      const players = [...tbody.querySelectorAll('tr')].map((tr) => ({
+        uid: tr.dataset.uid,
+        seat: tr.querySelector('.seat').value,
+        nick: tr.querySelector('.nick').value.trim(),
+      }));
       const rows = r.noms
         .map((n) => {
           const tr = rowByUid(n.uid);
           const seat = tr.querySelector('.seat').value;
           const nick = tr.querySelector('.nick').value.trim();
-          const btns = counts
-            .map((c) => `<td><button type="button" class="vote-btn${c === n.votes ? ' active' : ''}" data-votes="${c}">${c}</button></td>`)
+          const btns = players
+            .map((p) => {
+              const on = n.voters?.includes(p.uid);
+              return `<td><button type="button" class="vote-btn${on ? ' active' : ''}" data-voter="${p.uid}" aria-pressed="${!!on}"
+                title="${esc(p.nick || `Игрок ${p.seat}`)}">${esc(p.seat)}</button></td>`;
+            })
             .join('');
           const outElsewhere = outIn.has(n.uid) && outIn.get(n.uid) !== ri;
+          const legacy = !n.voters && n.votes ? ' title="Старая запись: известно только число голосов"' : '';
           return `
             <tr data-uid="${n.uid}" class="${n.out ? 'out' : ''}">
               <td class="v-del"><button type="button" class="icon-btn del-nom" title="Убрать с голосования" aria-label="Убрать с голосования">${TRASH}</button></td>
               <td class="v-player"><b>${esc(seat)}</b> <span>${esc(nick)}</span></td>
-              <td class="v-count">${n.votes}</td>
+              <td class="v-count"${legacy}>${voteCount(n)}</td>
               ${btns}
               <td class="v-out"><button type="button" class="out-btn${n.out ? ' active' : ''}" aria-pressed="${n.out}"
                 ${outElsewhere ? `disabled title="Уже заголосован в голосовании ${outIn.get(n.uid) + 1}"` : ''}>Заголосован</button></td>
@@ -348,7 +390,7 @@
                 <th></th>
                 <th class="v-player" title="Выставлен">${THUMB}</th>
                 <th class="v-count" title="Всего голосов">${total}</th>
-                <th colspan="${counts.length}">Кол-во голосов</th>
+                <th colspan="${players.length}">Кто голосовал</th>
                 <th></th>
               </tr>
             </thead>
@@ -358,10 +400,9 @@
     }
 
     function renderVotes() {
-      const maxVotes = tbody.querySelectorAll('tr').length;
       for (const r of rounds) {
         r.noms = r.noms.filter((n) => rowByUid(n.uid));
-        r.noms.forEach((n) => (n.votes = Math.min(n.votes, maxVotes)));
+        for (const n of r.noms) if (n.voters) n.voters = n.voters.filter((u) => rowByUid(u));
       }
       const outIn = outRounds();
       const inActive = new Set(rounds[active].noms.map((n) => n.uid));
@@ -388,7 +429,7 @@
               ${ri === active ? '<span class="round-badge">выставляем сюда</span>' : ''}
               <button type="button" class="icon-btn del-round" title="Удалить голосование" aria-label="Удалить голосование">${TRASH}</button>
             </div>
-            ${roundTable(r, ri, maxVotes, outIn)}
+            ${roundTable(r, ri, outIn)}
           </div>`
         )
         .join('');
@@ -413,7 +454,11 @@
       const tr = e.target.closest('tbody tr');
       const n = tr && r.noms.find((x) => x.uid === tr.dataset.uid);
       if (n && e.target.closest('.del-nom')) r.noms = r.noms.filter((x) => x !== n);
-      else if (n && e.target.closest('.vote-btn')) n.votes = Number(e.target.closest('.vote-btn').dataset.votes);
+      else if (n && e.target.closest('.vote-btn')) {
+        const voter = e.target.closest('.vote-btn').dataset.voter;
+        n.voters = n.voters || []; // старая запись с одним числом становится списком
+        n.voters = n.voters.includes(voter) ? n.voters.filter((u) => u !== voter) : [...n.voters, voter];
+      }
       else if (n && e.target.closest('.out-btn')) n.out = !n.out;
       else if (ri === active) return;
       active = ri; // любое действие внутри голосования делает его активным
@@ -451,14 +496,18 @@
       }
       if (e.target.closest('.nom-btn')) {
         const r = rounds[active];
-        if (!r.noms.some((n) => n.uid === tr.dataset.uid)) r.noms.push({ uid: tr.dataset.uid, votes: 0, out: false });
+        if (!r.noms.some((n) => n.uid === tr.dataset.uid)) r.noms.push({ uid: tr.dataset.uid, voters: [], votes: 0, out: false });
         renderVotes();
         return;
       }
+      if (e.target.closest('.dead-btn')) {
+        setDead(tr, !tr.classList.contains('dead'));
+        return;
+      }
       if (e.target.closest('.role-btn')) {
-        const picked = await pickRole(tr.dataset.role, usedRoles(), currentScript());
+        const picked = await pickRole(tr.dataset.role, !!tr.dataset.flipped, usedRoles(), currentScript());
         if (picked !== undefined) {
-          setRole(tr, picked);
+          setRole(tr, picked?.role, picked?.flipped);
           tr.querySelector('.score').focus();
         }
       }
@@ -466,7 +515,7 @@
 
     form.addEventListener('change', (e) => {
       if (e.target.name === 'winner') head.className = 'editor-head ' + e.target.value;
-      if (e.target.name === 'scriptId') tbody.querySelectorAll('tr').forEach((tr) => setRole(tr, tr.dataset.role));
+      if (e.target.name === 'scriptId') tbody.querySelectorAll('tr').forEach((tr) => setRole(tr, tr.dataset.role, tr.dataset.flipped));
     });
 
     const del = form.querySelector('.delete');
@@ -498,14 +547,16 @@
           seat: Number(tr.querySelector('.seat').value),
           nick: tr.querySelector('.nick').value.trim(),
           role: tr.dataset.role || null,
+          flipped: !!tr.dataset.flipped,
+          dead: tr.classList.contains('dead'),
           score: tr.querySelector('.score').value.trim().replace(',', '.') || null,
         })),
         votings: rounds
           .filter((r) => r.noms.length)
           .map((r) => ({
             nominations: r.noms.map((n) => ({
-              seat: Number(rowByUid(n.uid).querySelector('.seat').value),
-              votes: n.votes,
+              seat: seatOf(n.uid),
+              ...(n.voters ? { voters: n.voters.map(seatOf) } : { votes: n.votes }),
               out: n.out,
             })),
           })),
@@ -789,35 +840,60 @@
     if (e.key === 'Escape') closePicker(undefined);
   }
 
-  // Возвращает id роли, null (убрать роль) или undefined (отмена)
-  function pickRole(current, used, script) {
-    const groups = Object.entries(CATALOG.teams)
+  const SIDE_ADJ = { good: 'добрые', evil: 'злые' };
+
+  // Вкладка «Сменили сторону» — те же роли с перекрашенными иконками:
+  // злые горожане и изгои, добрые приспешники и демоны.
+  function pickerSet(script, flipped, current, currentFlipped, used) {
+    return Object.entries(CATALOG.teams)
       .map(([teamId, team]) => {
-        if (team.storyteller) return '';
+        if (team.storyteller || (flipped && !team.alignment)) return '';
         const roles = CATALOG.roles.filter((r) => r.team === teamId && script.roles.includes(r.id));
         if (!roles.length) return '';
         const items = roles
           .map((r) => {
-            const cls = ['role-opt', r.id === current ? 'current' : '', used.includes(r.id) && r.id !== current ? 'used' : '']
+            const isCurrent = r.id === current && flipped === currentFlipped;
+            const cls = ['role-opt', isCurrent ? 'current' : '', used.includes(r.id) && r.id !== current ? 'used' : '']
               .filter(Boolean)
               .join(' ');
-            return `<button type="button" class="${cls}" data-role="${r.id}" title="${esc(r.name)}">
-              <img src="${CATALOG.icon(r.id)}" alt=""><span>${esc(r.name)}</span></button>`;
+            return `<button type="button" class="${cls}" data-role="${r.id}" data-flipped="${flipped ? 1 : ''}" title="${esc(roleTitle(r.id, flipped))}">
+              <img src="${CATALOG.icon(r.id, flipped)}" alt=""><span>${esc(r.name)}</span></button>`;
           })
           .join('');
-        return `<section class="team team-${teamId}"><h3>${team.name}</h3><div class="role-grid">${items}</div></section>`;
+        const side = flipped ? CATALOG.alignmentOf(roles[0].id, true) : null;
+        const heading = flipped ? `${team.name} — ${SIDE_ADJ[side]}` : team.name;
+        return `<section class="team team-${flipped ? `side-${side}` : teamId}"><h3>${heading}</h3><div class="role-grid">${items}</div></section>`;
       })
       .join('');
-    pickerBody.innerHTML = groups;
+  }
+
+  function showPickerTab(flipped) {
+    pickerBody.querySelectorAll('.picker-tab').forEach((t) => t.setAttribute('aria-selected', t.dataset.tab === (flipped ? 'flipped' : 'normal')));
+    pickerBody.querySelector('[data-set=normal]').hidden = flipped;
+    pickerBody.querySelector('[data-set=flipped]').hidden = !flipped;
+  }
+
+  // Возвращает { role, flipped }, null (убрать роль) или undefined (отмена)
+  function pickRole(current, currentFlipped, used, script) {
+    pickerBody.innerHTML = `
+      <div class="picker-tabs" role="tablist">
+        <button type="button" class="picker-tab" role="tab" data-tab="normal">Обычная сторона</button>
+        <button type="button" class="picker-tab" role="tab" data-tab="flipped">Сменили сторону</button>
+      </div>
+      <div data-set="normal">${pickerSet(script, false, current, currentFlipped, used)}</div>
+      <div data-set="flipped">${pickerSet(script, true, current, currentFlipped, used)}</div>`;
+    showPickerTab(currentFlipped);
     picker.hidden = false;
     document.addEventListener('keydown', onPickerKey);
-    (pickerBody.querySelector('.current') || pickerBody.querySelector('.role-opt'))?.focus();
+    (pickerBody.querySelector('.current') || pickerBody.querySelector('[data-set]:not([hidden]) .role-opt'))?.focus();
     return new Promise((resolve) => (pickerResolve = resolve));
   }
 
   pickerBody.addEventListener('click', (e) => {
+    const tab = e.target.closest('.picker-tab');
+    if (tab) return showPickerTab(tab.dataset.tab === 'flipped');
     const opt = e.target.closest('.role-opt');
-    if (opt) closePicker(opt.dataset.role);
+    if (opt) closePicker({ role: opt.dataset.role, flipped: !!opt.dataset.flipped });
   });
   picker.querySelectorAll('[data-close]').forEach((el) => el.addEventListener('click', () => closePicker(undefined)));
   document.getElementById('picker-clear').addEventListener('click', () => closePicker(null));

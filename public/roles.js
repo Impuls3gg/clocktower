@@ -42,11 +42,26 @@
     return [meta, ...script.roles];
   }
 
+  // Сторону можно сменить только ролям, у которых она определена типом (не путешественникам)
+  const canFlip = (id) => !!(byId[id] && TEAMS[byId[id].team].alignment);
+
+  // Фактическая сторона игрока: 'good' | 'evil' | null
+  function alignmentOf(id, flipped) {
+    const side = byId[id] ? TEAMS[byId[id].team].alignment : null;
+    if (!side || !flipped) return side;
+    return side === 'good' ? 'evil' : 'good';
+  }
+
+  // Сменившим сторону — перекрашенная иконка: <id>_evil.png или <id>_good.png
+  const icon = (id, flipped) => (flipped && canFlip(id) ? `roles/${id}_${alignmentOf(id, true)}.png` : `roles/${id}.png`);
+
   const CATALOG = {
     teams: TEAMS,
     roles: ROLES,
     byId,
-    icon: (id) => `roles/${id}.png`,
+    icon,
+    canFlip,
+    alignmentOf,
     parseScript,
     scriptToJson,
   };
